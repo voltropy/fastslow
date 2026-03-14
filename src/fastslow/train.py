@@ -93,6 +93,11 @@ class TrainingConfig:
     dropout: float
     artifacts_dir: Path
     device: str
+    # Curriculum learning: ramp train_pairs from curriculum_start to train_pairs
+    curriculum_start: int | None = None  # None = no curriculum
+    curriculum_end_step: int | None = None  # step at which full train_pairs is reached
+    # Separate LR scaling for slow stream parameters
+    slow_lr_scale: float = 1.0  # multiplier on base LR for slow stream params
 
 
 @dataclass(frozen=True)
@@ -127,6 +132,15 @@ def parse_args() -> TrainingConfig:
         else:
             parser.add_argument(arg, type=float)
 
+    # Curriculum learning args
+    parser.add_argument("--curriculum-start", type=int, default=None,
+                        help="Start train_pairs for curriculum (ramps to --train-pairs)")
+    parser.add_argument("--curriculum-end-step", type=int, default=None,
+                        help="Step at which curriculum reaches full train_pairs")
+    # Slow stream LR scaling
+    parser.add_argument("--slow-lr-scale", type=float, default=1.0,
+                        help="LR multiplier for slow stream params (< 1.0 reduces slow stream gradient impact)")
+
     args = parser.parse_args()
     preset = PRESETS[args.preset].copy()
     for key in preset:
@@ -135,6 +149,13 @@ def parse_args() -> TrainingConfig:
             preset[key] = value
 
     artifacts_dir = Path(args.artifacts_dir or f"artifacts/{args.run_name}")
+
+    # Validate curriculum args
+    if args.curriculum_start is not None and args.curriculum_end_step is None:
+        args.curriculum_end_step = preset["steps"] // 3  # default: ramp over first third
+    if args.curriculum_start is not None and args.curriculum_start >= preset["train_pairs"]:
+        raise ValueError(f"curriculum_start ({args.curriculum_start}) must be < train_pairs ({preset['train_pairs']})")
+
     return TrainingConfig(
         variant=args.variant,
         preset=args.preset,
@@ -143,6 +164,9 @@ def parse_args() -> TrainingConfig:
         tracking_backend=args.tracking_backend,
         artifacts_dir=artifacts_dir,
         device=args.device,
+        curriculum_start=args.curriculum_start,
+        curriculum_end_step=args.curriculum_end_step,
+        slow_lr_scale=args.slow_lr_scale,
         **preset,
     )
 
@@ -263,6 +287,14 @@ def append_history(path: Path, payload: dict[str, Any]) -> None:
         handle.write(json.dumps(payload, sort_keys=True) + "\n")
 
 
+def curriculum_pairs(step: int, start_pairs: int, end_pairs: int, end_step: int) -> int:
+    """Linearly ramp number of training pairs from start_pairs to end_pairs over end_step steps."""
+    if step >= end_step:
+        return end_pairs
+    progress = step / max(end_step, 1)
+    return int(start_pairs + (end_pairs - start_pairs) * progress)
+
+
 def learning_rate(step: int, base_lr: float, warmup_steps: int, total_steps: int) -> float:
     if step <= warmup_steps:
         return base_lr * step / max(warmup_steps, 1)
@@ -307,7 +339,24 @@ def train(config: TrainingConfig) -> None:
         tracker = build_tracker(artifacts_dir, config.tracking_backend) if runtime.is_main_process else NullTracker()
         tracker.phase("train")
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        # Build optimizer with optional separate LR for slow stream params
+        if config.slow_lr_scale != 1.0 and config.variant in ("fastslow", "fastslow_every_layer"):
+            base_model = model.module if isinstance(model, DistributedDataParallel) else model
+            slow_param_names = {"init_slow", "slow_to_main", "main_to_slow", "injection_gate", "extraction_gate", "slow_blocks"}
+            slow_params = []
+            fast_params = []
+            for name, param in base_model.named_parameters():
+                if any(sp in name for sp in slow_param_names):
+                    slow_params.append(param)
+                else:
+                    fast_params.append(param)
+            param_groups = [
+                {"params": fast_params, "lr": config.lr},
+                {"params": slow_params, "lr": config.lr * config.slow_lr_scale, "_is_slow": True},
+            ]
+            optimizer = torch.optim.AdamW(param_groups, weight_decay=config.weight_decay)
+        else:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
         history_path = artifacts_dir / "history.jsonl"
         checkpoint_path = artifacts_dir / "best.pt"
         summary_path = artifacts_dir / "summary.json"
@@ -323,6 +372,9 @@ def train(config: TrainingConfig) -> None:
             "global_batch_size": config.batch_size * runtime.world_size,
             "model_params": count_parameters(model_for_artifacts),
             "resolved_model_config": resolved_model_config.__dict__,
+            "curriculum_start": config.curriculum_start,
+            "curriculum_end_step": config.curriculum_end_step,
+            "slow_lr_scale": config.slow_lr_scale,
         }
         if runtime.is_main_process:
             write_json(artifacts_dir / "config.json", resolved)
@@ -335,9 +387,16 @@ def train(config: TrainingConfig) -> None:
         for step in progress:
             lr = learning_rate(step, config.lr, config.warmup_steps, config.steps)
             for group in optimizer.param_groups:
-                group["lr"] = lr
+                scale = config.slow_lr_scale if group.get("_is_slow") else 1.0
+                group["lr"] = lr * scale
 
-            inputs, targets, mask = make_batch(config.batch_size, config.train_pairs, spec, runtime.device)
+            # Curriculum: ramp train_pairs if configured
+            if config.curriculum_start is not None:
+                current_pairs = curriculum_pairs(step, config.curriculum_start, config.train_pairs, config.curriculum_end_step)
+            else:
+                current_pairs = config.train_pairs
+
+            inputs, targets, mask = make_batch(config.batch_size, current_pairs, spec, runtime.device)
             logits = model(inputs)
             loss, accuracy = compute_masked_loss(logits, targets, mask)
 
@@ -352,6 +411,7 @@ def train(config: TrainingConfig) -> None:
                     "train_acc": float(accuracy),
                     "lr": float(lr),
                     "grad_norm": float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
+                    "train_pairs": float(current_pairs),
                 },
                 runtime,
             )

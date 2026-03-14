@@ -165,7 +165,7 @@ class FastSlowTransformerLM(nn.Module):
         positions = _sinusoidal_positions(seq, self.config.d_model, tokens.device)
         main = self.token_embedding(tokens) + positions.unsqueeze(0)
         main = self.dropout(main)
-        slow = self.init_slow(main)
+        slow = self.init_slow(main.detach())
         update_count = 0
 
         gate = torch.sigmoid(self.injection_gate)
@@ -175,7 +175,7 @@ class FastSlowTransformerLM(nn.Module):
             main = block(main + gate * self.slow_to_main(slow))
             if layer_idx % self.config.slow_update_gap == 0:
                 slow_block = self.slow_blocks[update_count % len(self.slow_blocks)]
-                slow = slow_block(slow + ext_gate * self.main_to_slow(main))
+                slow = slow_block(slow + ext_gate * self.main_to_slow(main.detach()))
                 update_count += 1
 
         main = self.final_ln(main)
