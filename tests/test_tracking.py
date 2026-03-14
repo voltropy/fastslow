@@ -25,6 +25,26 @@ def test_validate_tracking_backend_requires_strict_volta_env(monkeypatch: pytest
         validate_tracking_backend("auto")
 
 
+def test_validate_tracking_backend_requires_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VOLTA_PROJECT", "fastslow")
+    monkeypatch.setenv("VOLTA_EXPERIMENT", "run-1")
+    monkeypatch.setenv("VOLTA_SPANNER_DATABASE", "projects/x/instances/y/databases/z")
+    monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+
+    with pytest.raises(RuntimeError, match="GOOGLE_APPLICATION_CREDENTIALS"):
+        validate_tracking_backend("auto")
+
+
+def test_validate_tracking_backend_rejects_missing_creds_file(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VOLTA_PROJECT", "fastslow")
+    monkeypatch.setenv("VOLTA_EXPERIMENT", "run-1")
+    monkeypatch.setenv("VOLTA_SPANNER_DATABASE", "projects/x/instances/y/databases/z")
+    monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", "/nonexistent/sa-key.json")
+
+    with pytest.raises(RuntimeError, match="does not exist"):
+        validate_tracking_backend("auto")
+
+
 def test_default_anomaly_check_flags_non_finite() -> None:
     message = default_anomaly_check(
         {"step": 12, "train_loss": float("inf")},

@@ -128,6 +128,7 @@ class VoltaTracker:
 
 
 STRICT_VOLTA_ENV_VARS = ("VOLTA_PROJECT", "VOLTA_EXPERIMENT", "VOLTA_SPANNER_DATABASE")
+STRICT_VOLTA_AUTH_VARS = ("GOOGLE_APPLICATION_CREDENTIALS",)
 
 
 def _should_use_volta(tracking_backend: str) -> bool:
@@ -149,6 +150,19 @@ def validate_tracking_backend(tracking_backend: str) -> None:
         raise RuntimeError(
             "Volta tracking requested but required environment variables are missing: "
             + ", ".join(missing)
+        )
+    missing_auth = [key for key in STRICT_VOLTA_AUTH_VARS if not os.getenv(key)]
+    if missing_auth:
+        raise RuntimeError(
+            "Volta tracking requested but authentication is not configured: "
+            + ", ".join(missing_auth)
+            + ". Mount a service account key and set GOOGLE_APPLICATION_CREDENTIALS."
+        )
+    creds_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "")
+    if creds_path and not Path(creds_path).exists():
+        raise RuntimeError(
+            f"GOOGLE_APPLICATION_CREDENTIALS points to {creds_path!r} which does not exist. "
+            "Check that the service account key is mounted correctly."
         )
     if importlib.util.find_spec("volta") is None:
         raise RuntimeError(
