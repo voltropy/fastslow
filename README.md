@@ -9,7 +9,7 @@ The repo contains four variants on the same long-range associative-recall task:
 - `fastslow_every_layer`: same two-stream parameter budget, but the slow stream updates every layer.
 - `widened_baseline`: standard Transformer widened until it roughly matches the `fastslow` parameter count.
 
-The experiment is set up to use the latest `voltropy/volta2` path when a real Volta backend is configured. For local smoke tests without backend provisioning, it falls back to JSONL tracking so the training code still runs.
+The experiment is set up to use the latest `voltropy/volta2` path when a real Volta backend is configured. Local JSONL tracking still exists for explicit smoke-test mode, but the training process no longer silently falls back when Volta has been requested.
 
 ## Experiment summary
 
@@ -31,7 +31,9 @@ This is intentionally simple. It gives a clean first read on whether a slow stre
 - `src/fastslow/data.py`: on-the-fly associative-recall batch generation.
 - `src/fastslow/models.py`: baseline and fast/slow Transformer implementations.
 - `src/fastslow/train.py`: CLI entrypoint, training loop, evaluation, checkpoints, summaries.
-- `src/fastslow/tracking.py`: Volta-first tracker with JSONL fallback.
+- `src/fastslow/tracking.py`: strict Volta tracker bootstrap plus explicit JSONL debug mode.
+- `scripts/launch_ddp.sh`: `torchrun` helper for full-node launches.
+- `Dockerfile`: container build that starts from `volta-runtime:latest`.
 - `tests/`: light unit coverage for data/model plumbing.
 
 ## Local development
@@ -53,17 +55,26 @@ source .venv/bin/activate
 python -m fastslow.train \
   --variant fastslow \
   --preset quick \
+  --tracking-backend jsonl \
   --run-name local-smoke \
   --artifacts-dir artifacts/local-smoke
 ```
 
-That uses local JSONL tracking in `artifacts/local-smoke/metrics.jsonl`.
+That uses explicit local JSONL tracking in `artifacts/local-smoke/metrics.jsonl`.
 
 ## OpenClaw runbook
 
 These are the DevOps steps OpenClaw should carry out before running the real experiment through Volta.
 
-### 1. Provision the runtime
+### 1. Build the container
+
+Use the repo Dockerfile. It now starts from `volta-runtime:latest`.
+
+```bash
+docker build -t fastslow:latest .
+```
+
+### 2. Provision the runtime
 
 - Create a Python 3.10-3.13 environment.
 - Install the repo:
@@ -73,7 +84,13 @@ python -m pip install --upgrade pip
 python -m pip install -e .
 ```
 
-### 2. Install the latest Volta from `voltropy/volta2`
+If not using the base image, install the Volta Python bindings explicitly:
+
+```bash
+python -m pip install -e ".[volta]"
+```
+
+### 3. Install the latest Volta from `voltropy/volta2`
 
 The latest Volta revision I inspected was commit `385e2210e515cc510116592e57320314acbf485c` from March 14, 2026 UTC.
 
@@ -88,30 +105,44 @@ maturin develop --features python
 export PATH="/tmp/volta2/target/release:$PATH"
 ```
 
-### 3. Provision a real Volta backend
+### 4. Provision a real Volta backend
 
-The latest Volta Python binding only persists runs when a backend is configured. For a real tracked run, OpenClaw should provision and export:
+The latest Volta Python binding only persists runs when a backend is configured. This repo treats Volta mode as strict: if `volta` import fails, credentials are bad, or `VOLTA_SPANNER_DATABASE` is missing, training should crash instead of quietly switching to JSONL.
+
+For a real tracked run, OpenClaw should provision and export:
 
 - `VOLTA_SPANNER_DATABASE`
 - `VOLTA_GCS_BUCKET`
 - `GOOGLE_APPLICATION_CREDENTIALS`
 
-If those are absent, this repo falls back to local JSONL tracking for debugging only.
+Local JSONL mode is only for explicit debug runs via `--tracking-backend jsonl`.
 
-### 4. Create and launch the Volta experiment
+### 5. Execution model for 8x B200 machines
+
+Primary intent: one variant per 8x B200 node, using all 8 GPUs with DDP via `torchrun`.
+
+- This repo auto-enables distributed mode when launched under `torchrun`.
+- `batch_size` is per-rank. Global batch size is `batch_size * WORLD_SIZE`.
+- Only rank 0 talks to Volta and writes artifacts.
+- Checkpoint saves transition through `phase("checkpoint")`.
+
+If throughput matters more than per-run speed, OpenClaw can still pack multiple single-GPU jobs onto a node with `CUDA_VISIBLE_DEVICES`, but the validated path is full-node DDP.
+
+### 6. Create and launch the Volta experiment
 
 Choose a machine label and run name, then:
 
 ```bash
 export RUN_NAME=fs-k4-seed0
-export MACHINE_LABEL=openclaw-gpu
+export MACHINE_LABEL=openclaw-b200x8
 
 volta create "fastslow/${RUN_NAME}" \
   --git-repo https://github.com/voltropy/fastslow \
   --machine "${MACHINE_LABEL}" \
-  --command "python -m fastslow.train --variant fastslow --preset default --run-name ${RUN_NAME} --artifacts-dir artifacts/${RUN_NAME}" \
-  --config '{"variant":"fastslow","preset":"default","seed":0}' \
-  --description "Fast/slow residual-stream associative-recall baseline run"
+  --docker-image fastslow:latest \
+  --command "bash scripts/launch_ddp.sh --variant fastslow --preset default --tracking-backend volta --run-name ${RUN_NAME} --artifacts-dir artifacts/${RUN_NAME}" \
+  --config '{"variant":"fastslow","preset":"default","seed":0,"tracking_backend":"volta","nproc_per_node":8}' \
+  --description "Fast/slow residual-stream associative-recall baseline run on 8x B200"
 
 volta launch "fastslow/${RUN_NAME}" "${MACHINE_LABEL}"
 ```
@@ -123,20 +154,20 @@ export VOLTA_PROJECT=fastslow
 export VOLTA_EXPERIMENT="${RUN_NAME}"
 ```
 
-### 5. Run the full comparison set
+### 7. Run the full comparison set
 
 Run at least these four jobs:
 
 ```bash
-python -m fastslow.train --variant baseline --preset default --run-name baseline-seed0 --artifacts-dir artifacts/baseline-seed0
-python -m fastslow.train --variant fastslow --preset default --run-name fs-k4-seed0 --artifacts-dir artifacts/fs-k4-seed0
-python -m fastslow.train --variant fastslow_every_layer --preset default --run-name fs-k1-seed0 --artifacts-dir artifacts/fs-k1-seed0
-python -m fastslow.train --variant widened_baseline --preset default --run-name wide-seed0 --artifacts-dir artifacts/wide-seed0
+bash scripts/launch_ddp.sh --variant baseline --preset default --tracking-backend volta --run-name baseline-seed0 --artifacts-dir artifacts/baseline-seed0
+bash scripts/launch_ddp.sh --variant fastslow --preset default --tracking-backend volta --run-name fs-k4-seed0 --artifacts-dir artifacts/fs-k4-seed0
+bash scripts/launch_ddp.sh --variant fastslow_every_layer --preset default --tracking-backend volta --run-name fs-k1-seed0 --artifacts-dir artifacts/fs-k1-seed0
+bash scripts/launch_ddp.sh --variant widened_baseline --preset default --tracking-backend volta --run-name wide-seed0 --artifacts-dir artifacts/wide-seed0
 ```
 
 For each run, OpenClaw should create and launch a matching Volta experiment first, then set `VOLTA_PROJECT` and `VOLTA_EXPERIMENT` to the matching name before starting training.
 
-### 6. Compare the results
+### 8. Compare the results
 
 Target signals:
 
@@ -157,17 +188,17 @@ With Volta enabled, metrics also stream into the configured backend.
 Quick sweep:
 
 ```bash
-python -m fastslow.train --variant fastslow --preset default --seed 0 --run-name fs-k4-seed0
+bash scripts/launch_ddp.sh --variant fastslow --preset default --tracking-backend volta --seed 0 --run-name fs-k4-seed0
 ```
 
 Baseline:
 
 ```bash
-python -m fastslow.train --variant baseline --preset default --seed 0 --run-name baseline-seed0
+bash scripts/launch_ddp.sh --variant baseline --preset default --tracking-backend volta --seed 0 --run-name baseline-seed0
 ```
 
 Parameter-matched widened baseline:
 
 ```bash
-python -m fastslow.train --variant widened_baseline --preset default --seed 0 --run-name wide-seed0
+bash scripts/launch_ddp.sh --variant widened_baseline --preset default --tracking-backend volta --seed 0 --run-name wide-seed0
 ```

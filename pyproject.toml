@@ -18,6 +18,9 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+volta = [
+  "volta @ git+https://github.com/voltropy/volta2.git",
+]
 
 [project.scripts]
 fastslow-train = "fastslow.train:main"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
@@ -10,13 +11,15 @@ from typing import Any
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel
 from tqdm.auto import tqdm
 
 from fastslow.data import TaskSpec, make_batch
 from fastslow.models import build_model, count_parameters, default_model_config
-from fastslow.tracking import build_tracker
+from fastslow.tracking import NullTracker, build_tracker, validate_tracking_backend
 
 
 PRESETS: dict[str, dict[str, Any]] = {
@@ -69,6 +72,7 @@ class TrainingConfig:
     preset: str
     run_name: str
     seed: int
+    tracking_backend: str
     train_pairs: int
     eval_pairs: list[int]
     steps: int
@@ -91,12 +95,26 @@ class TrainingConfig:
     device: str
 
 
+@dataclass(frozen=True)
+class RuntimeContext:
+    device: torch.device
+    rank: int
+    local_rank: int
+    world_size: int
+    distributed: bool
+
+    @property
+    def is_main_process(self) -> bool:
+        return self.rank == 0
+
+
 def parse_args() -> TrainingConfig:
     parser = argparse.ArgumentParser(description="Train FastSlow experiment variants.")
     parser.add_argument("--variant", choices=["baseline", "fastslow", "fastslow_every_layer", "widened_baseline"], required=True)
     parser.add_argument("--preset", choices=sorted(PRESETS), default="default")
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--tracking-backend", choices=["auto", "volta", "jsonl"], default="auto")
     parser.add_argument("--artifacts-dir", default=None)
     parser.add_argument("--device", default="auto")
 
@@ -122,6 +140,7 @@ def parse_args() -> TrainingConfig:
         preset=args.preset,
         run_name=args.run_name,
         seed=args.seed,
+        tracking_backend=args.tracking_backend,
         artifacts_dir=artifacts_dir,
         device=args.device,
         **preset,
@@ -146,6 +165,53 @@ def choose_device(raw: str) -> torch.device:
     return torch.device(raw)
 
 
+def init_runtime(raw_device: str) -> RuntimeContext:
+    world_size = int(os.getenv("WORLD_SIZE", "1"))
+    rank = int(os.getenv("RANK", "0"))
+    local_rank = int(os.getenv("LOCAL_RANK", "0"))
+    distributed = world_size > 1
+
+    if distributed:
+        if raw_device not in {"auto", "cuda"} and not raw_device.startswith("cuda"):
+            raise ValueError("Distributed execution requires CUDA; use --device auto or --device cuda.")
+        if not torch.cuda.is_available():
+            raise RuntimeError("Distributed execution requested but CUDA is unavailable.")
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+        device = torch.device("cuda", local_rank)
+    else:
+        device = choose_device(raw_device)
+
+    return RuntimeContext(
+        device=device,
+        rank=rank,
+        local_rank=local_rank,
+        world_size=world_size,
+        distributed=distributed,
+    )
+
+
+def cleanup_runtime(runtime: RuntimeContext) -> None:
+    if runtime.distributed and dist.is_initialized():
+        dist.destroy_process_group()
+
+
+def reduce_metrics(metrics: dict[str, float], runtime: RuntimeContext) -> dict[str, float]:
+    if not runtime.distributed:
+        return metrics
+
+    ordered_keys = sorted(metrics)
+    tensor = torch.tensor([metrics[key] for key in ordered_keys], device=runtime.device, dtype=torch.float64)
+    dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+    tensor /= runtime.world_size
+    return {key: float(value) for key, value in zip(ordered_keys, tensor.tolist())}
+
+
+def maybe_barrier(runtime: RuntimeContext) -> None:
+    if runtime.distributed:
+        dist.barrier()
+
+
 def compute_masked_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, float]:
     vocab = logits.shape[-1]
     flat_loss = F.cross_entropy(logits.reshape(-1, vocab), targets.reshape(-1), reduction="none")
@@ -160,7 +226,7 @@ def compute_masked_loss(logits: torch.Tensor, targets: torch.Tensor, mask: torch
 def evaluate(
     model: nn.Module,
     spec: TaskSpec,
-    device: torch.device,
+    runtime: RuntimeContext,
     eval_pairs: list[int],
     batch_size: int,
     eval_batches: int,
@@ -171,11 +237,15 @@ def evaluate(
         losses = []
         accuracies = []
         for _ in range(eval_batches):
-            inputs, targets, mask = make_batch(batch_size, num_pairs, spec, device)
+            inputs, targets, mask = make_batch(batch_size, num_pairs, spec, runtime.device)
             logits = model(inputs)
             loss, accuracy = compute_masked_loss(logits, targets, mask)
-            losses.append(loss.item())
-            accuracies.append(accuracy)
+            reduced = reduce_metrics(
+                {"eval_loss": float(loss.item()), "eval_acc": float(accuracy)},
+                runtime,
+            )
+            losses.append(reduced["eval_loss"])
+            accuracies.append(reduced["eval_acc"])
         metrics[f"eval_loss_pairs_{num_pairs}"] = float(np.mean(losses))
         metrics[f"eval_acc_pairs_{num_pairs}"] = float(np.mean(accuracies))
     model.train()
@@ -201,56 +271,73 @@ def learning_rate(step: int, base_lr: float, warmup_steps: int, total_steps: int
 
 
 def train(config: TrainingConfig) -> None:
-    set_seed(config.seed)
-    device = choose_device(config.device)
-    spec = TaskSpec()
-    max_pairs = max([config.train_pairs, *config.eval_pairs])
-    max_seq_len = max_pairs * 3 + 2
-    base_model_config = default_model_config(spec, max_seq_len)
-    base_model_config = replace(
-        base_model_config,
-        d_model=config.d_model,
-        n_heads=config.n_heads,
-        n_layers=config.n_layers,
-        d_ff=config.d_ff,
-        d_slow=config.d_slow,
-        slow_update_gap=config.slow_update_gap,
-        dropout=config.dropout,
-    )
-    model, resolved_model_config = build_model(config.variant, base_model_config)
-    model.to(device)
-
-    artifacts_dir = config.artifacts_dir
-    artifacts_dir.mkdir(parents=True, exist_ok=True)
-    tracker = build_tracker(artifacts_dir)
-    tracker.phase("train")
-
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    history_path = artifacts_dir / "history.jsonl"
-    checkpoint_path = artifacts_dir / "best.pt"
-    summary_path = artifacts_dir / "summary.json"
-
-    resolved = {
-        **asdict(config),
-        "artifacts_dir": str(config.artifacts_dir),
-        "tracker_mode": tracker.mode,
-        "device_resolved": str(device),
-        "model_params": count_parameters(model),
-        "resolved_model_config": resolved_model_config.__dict__,
-    }
-    write_json(artifacts_dir / "config.json", resolved)
-
-    best_metric = -1.0
-    last_eval: dict[str, float] = {}
-
-    progress = tqdm(range(1, config.steps + 1), desc=f"{config.variant}:{config.run_name}")
+    runtime = init_runtime(config.device)
     try:
+        validate_tracking_backend(config.tracking_backend)
+        set_seed(config.seed + runtime.rank)
+        spec = TaskSpec()
+        max_pairs = max([config.train_pairs, *config.eval_pairs])
+        max_seq_len = max_pairs * 3 + 2
+        base_model_config = default_model_config(spec, max_seq_len)
+        base_model_config = replace(
+            base_model_config,
+            d_model=config.d_model,
+            n_heads=config.n_heads,
+            n_layers=config.n_layers,
+            d_ff=config.d_ff,
+            d_slow=config.d_slow,
+            slow_update_gap=config.slow_update_gap,
+            dropout=config.dropout,
+        )
+        model, resolved_model_config = build_model(config.variant, base_model_config)
+        model.to(runtime.device)
+        if runtime.distributed:
+            model = DistributedDataParallel(
+                model,
+                device_ids=[runtime.local_rank],
+                output_device=runtime.local_rank,
+            )
+        model_for_artifacts = model.module if isinstance(model, DistributedDataParallel) else model
+
+        artifacts_dir = config.artifacts_dir
+        if runtime.is_main_process:
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+        maybe_barrier(runtime)
+
+        tracker = build_tracker(artifacts_dir, config.tracking_backend) if runtime.is_main_process else NullTracker()
+        tracker.phase("train")
+
+        optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+        history_path = artifacts_dir / "history.jsonl"
+        checkpoint_path = artifacts_dir / "best.pt"
+        summary_path = artifacts_dir / "summary.json"
+
+        resolved = {
+            **asdict(config),
+            "artifacts_dir": str(config.artifacts_dir),
+            "tracker_mode": tracker.mode,
+            "device_resolved": str(runtime.device),
+            "distributed": runtime.distributed,
+            "world_size": runtime.world_size,
+            "per_rank_batch_size": config.batch_size,
+            "global_batch_size": config.batch_size * runtime.world_size,
+            "model_params": count_parameters(model_for_artifacts),
+            "resolved_model_config": resolved_model_config.__dict__,
+        }
+        if runtime.is_main_process:
+            write_json(artifacts_dir / "config.json", resolved)
+
+        best_metric = -1.0
+        last_eval: dict[str, float] = {}
+
+        iterator = range(1, config.steps + 1)
+        progress = tqdm(iterator, desc=f"{config.variant}:{config.run_name}") if runtime.is_main_process else iterator
         for step in progress:
             lr = learning_rate(step, config.lr, config.warmup_steps, config.steps)
             for group in optimizer.param_groups:
                 group["lr"] = lr
 
-            inputs, targets, mask = make_batch(config.batch_size, config.train_pairs, spec, device)
+            inputs, targets, mask = make_batch(config.batch_size, config.train_pairs, spec, runtime.device)
             logits = model(inputs)
             loss, accuracy = compute_masked_loss(logits, targets, mask)
 
@@ -259,64 +346,95 @@ def train(config: TrainingConfig) -> None:
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), config.grad_clip)
             optimizer.step()
 
-            train_metrics = {
-                "train_loss": float(loss.item()),
-                "train_acc": float(accuracy),
-                "lr": float(lr),
-                "grad_norm": float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
-            }
-            if step % max(1, config.log_interval) == 0 or step == 1:
+            train_metrics = reduce_metrics(
+                {
+                    "train_loss": float(loss.item()),
+                    "train_acc": float(accuracy),
+                    "lr": float(lr),
+                    "grad_norm": float(grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm),
+                },
+                runtime,
+            )
+            if runtime.is_main_process and (step % max(1, config.log_interval) == 0 or step == 1):
                 tracker.log(step, train_metrics)
                 append_history(history_path, {"step": step, "phase": "train", **train_metrics})
 
             if step % max(1, config.eval_interval) == 0 or step == config.steps:
-                tracker.phase("eval")
+                maybe_barrier(runtime)
+                if runtime.is_main_process:
+                    tracker.phase("eval")
                 eval_metrics = evaluate(
                     model=model,
                     spec=spec,
-                    device=device,
+                    runtime=runtime,
                     eval_pairs=config.eval_pairs,
                     batch_size=config.batch_size,
                     eval_batches=config.eval_batches,
                 )
-                tracker.log(step, eval_metrics)
-                append_history(history_path, {"step": step, "phase": "eval", **eval_metrics})
-                tracker.phase("train")
+                if runtime.is_main_process:
+                    tracker.log(step, eval_metrics)
+                    append_history(history_path, {"step": step, "phase": "eval", **eval_metrics})
                 last_eval = eval_metrics
 
                 longest_key = f"eval_acc_pairs_{max(config.eval_pairs)}"
                 score = eval_metrics[longest_key]
-                if score >= best_metric:
+                if runtime.is_main_process and score >= best_metric:
                     best_metric = score
+                    tracker.phase("checkpoint")
+                    tracker.log(step, {"checkpoint_best_long_context_accuracy": float(score)})
+                    append_history(
+                        history_path,
+                        {
+                            "step": step,
+                            "phase": "checkpoint",
+                            "checkpoint_best_long_context_accuracy": float(score),
+                        },
+                    )
                     torch.save(
                         {
-                            "model_state": model.state_dict(),
+                            "model_state": model_for_artifacts.state_dict(),
                             "config": resolved,
                             "best_metric": best_metric,
                         },
                         checkpoint_path,
                     )
+                if runtime.is_main_process:
+                    tracker.phase("train")
 
-                progress.set_postfix(loss=f"{loss.item():.4f}", acc=f"{accuracy:.3f}", best=f"{best_metric:.3f}")
+                if runtime.is_main_process:
+                    progress.set_postfix(
+                        loss=f"{train_metrics['train_loss']:.4f}",
+                        acc=f"{train_metrics['train_acc']:.3f}",
+                        best=f"{best_metric:.3f}",
+                    )
+                maybe_barrier(runtime)
 
-        summary = {
-            "variant": config.variant,
-            "run_name": config.run_name,
-            "seed": config.seed,
-            "tracker_mode": tracker.mode,
-            "device": str(device),
-            "model_params": count_parameters(model),
-            "resolved_model_config": resolved_model_config.__dict__,
-            "train_pairs": config.train_pairs,
-            "eval_pairs": config.eval_pairs,
-            "best_long_context_accuracy": best_metric,
-            "final_eval": last_eval,
-        }
-        write_json(summary_path, summary)
-        tracker.complete(summary=f"best_long_context_accuracy={best_metric:.4f}")
+        if runtime.is_main_process:
+            summary = {
+                "variant": config.variant,
+                "run_name": config.run_name,
+                "seed": config.seed,
+                "tracker_mode": tracker.mode,
+                "device": str(runtime.device),
+                "distributed": runtime.distributed,
+                "world_size": runtime.world_size,
+                "per_rank_batch_size": config.batch_size,
+                "global_batch_size": config.batch_size * runtime.world_size,
+                "model_params": count_parameters(model_for_artifacts),
+                "resolved_model_config": resolved_model_config.__dict__,
+                "train_pairs": config.train_pairs,
+                "eval_pairs": config.eval_pairs,
+                "best_long_context_accuracy": best_metric,
+                "final_eval": last_eval,
+            }
+            write_json(summary_path, summary)
+            tracker.complete(summary=f"best_long_context_accuracy={best_metric:.4f}")
     except Exception as exc:
-        tracker.fail(summary=str(exc))
+        if "tracker" in locals() and runtime.is_main_process:
+            tracker.fail(summary=str(exc))
         raise
+    finally:
+        cleanup_runtime(runtime)
 
 
 def main() -> None:
