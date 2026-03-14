@@ -140,6 +140,8 @@ class FastSlowTransformerLM(nn.Module):
         self.init_slow = nn.Linear(config.d_model, config.d_slow)
         self.slow_to_main = nn.Linear(config.d_slow, config.d_model)
         self.main_to_slow = nn.Linear(config.d_model, config.d_slow)
+        self.injection_gate = nn.Parameter(torch.tensor(-5.0))  # sigmoid(-5) ≈ 0.007
+        self.extraction_gate = nn.Parameter(torch.tensor(-5.0))
 
         slow_heads = max(1, min(config.n_heads, config.d_slow))
         while config.d_slow % slow_heads != 0:
@@ -166,11 +168,14 @@ class FastSlowTransformerLM(nn.Module):
         slow = self.init_slow(main)
         update_count = 0
 
+        gate = torch.sigmoid(self.injection_gate)
+        ext_gate = torch.sigmoid(self.extraction_gate)
+
         for layer_idx, block in enumerate(self.main_blocks):
-            main = block(main + self.slow_to_main(slow))
+            main = block(main + gate * self.slow_to_main(slow))
             if layer_idx % self.config.slow_update_gap == 0:
                 slow_block = self.slow_blocks[update_count % len(self.slow_blocks)]
-                slow = slow_block(slow + self.main_to_slow(main))
+                slow = slow_block(slow + ext_gate * self.main_to_slow(main))
                 update_count += 1
 
         main = self.final_ln(main)
