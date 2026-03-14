@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fastslow"
+version = "0.1.0"
+description = "Fast/slow residual-stream Transformer experiment with Volta tracking hooks."
+readme = "README.md"
+requires-python = ">=3.10,<3.15"
+dependencies = [
+  "torch>=2.4",
+  "numpy>=1.26",
+  "tqdm>=4.66",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+fastslow-train = "fastslow.train:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
