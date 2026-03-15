@@ -183,6 +183,29 @@ The repo writes:
 
 With Volta enabled, metrics also stream into the configured backend.
 
+## Research Results (2026-03-14, 8 rounds on B200 fleet)
+
+### Summary
+**FastSlow provides no architectural advantage** on synthetic associative recall. Curriculum learning is the real discovery.
+
+### Key Findings
+- **Curriculum learning (32→96 pairs over 40K steps) + 0.1× slow stream LR** achieves 100% accuracy on 96-pair recall with FastSlow. Baseline stuck at 5.3% without curriculum.
+- **BUT**: multi-seed validation (Round 8) killed the advantage. Baseline seed=42 gets 60.3% @160 pairs, beating all FastSlow variants. Widened baseline seed=0 gets 53.6%.
+- **FastSlow adds fragility**: seed=123 never learns at all (5.4% @96p). 1/3 failure rate. Baseline never fails to learn.
+- **Curriculum learning IS the real discovery** — works for all architectures, not FastSlow-specific.
+- **Slow-LR ablation**: 0.1× optimal. 0.01× too aggressive, 0.3× similar near-transfer but worse far-transfer.
+
+### What went wrong
+Round 7 showed "440× advantage" — but that compared fastslow seed=0 (48.8% @160p) vs baseline seed=0 (0.11%). Baseline seed=0 was an outlier. **A single seed comparison is not science.**
+
+### Lessons
+- ALWAYS validate with 3+ seeds before claiming architectural advantage
+- "Best during training" is not the result — final eval is what matters
+- Curriculum learning (progressive difficulty) genuinely enables long-range generalization for any architecture at this scale
+- Both architectures show extreme seed sensitivity
+
+Code: commit `3c879a3` added `--curriculum-start`, `--curriculum-end-step`, `--slow-lr-scale`.
+
 ## Useful commands
 
 Quick sweep:
